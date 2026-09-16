@@ -1,6 +1,10 @@
 interface McpToolDefinition {
   name: string;
   description: string;
+  /** Human-facing one-liner (fleet #1967). Optional; consumers fall back to
+   *  description. Kept in step with shared/src/types.ts — scripts/lib/
+   *  check-inlined-types.mjs reports drift at publish time. */
+  summary?: string;
   inputSchema: {
     type: 'object';
     properties: Record<string, unknown>;
@@ -19,6 +23,203 @@ interface McpToolExport {
   cost?: Record<string, unknown>;
   provider?: string;
 }
+
+/**
+ * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
+ *
+ * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
+ * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
+ * covered the majority and structurally could not cover the rest: the rest
+ * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
+ * the 24h to 2026-09-02T15:00Z (fleet #1096):
+ *
+ *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
+ *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
+ *
+ * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
+ * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
+ * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
+ * our own Supabase for fleet. There is no third party anywhere in either call.
+ * Same defect as #1089: our own outage filed under `upstream_down`, the one
+ * class that means "the source is unreachable and there is nothing for us to
+ * fix", which is why the problem-tools triage skips it.
+ *
+ * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
+ * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
+ * one site today, so it would work today. It would also rot the first time
+ * somebody rewords a label — silently, and in the direction of hiding our own
+ * outage, which is worse than the bug being fixed. Every prose rule in
+ * error-class.ts has needed widening as packs invented new wording (#409/#450/
+ * #584); that history is most of that file's comment budget.
+ *
+ * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
+ * hostname is a fact about the call, not a guess about its prose. Two
+ * consequences that a pack-level flag could not give us, and the reason the
+ * flag was rejected:
+ *
+ *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
+ *     Supabase AND to genuine third parties; `court-listener` holds our cache
+ *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
+ *     either pack would relabel a real third-party outage as ours — inventing
+ *     work, which is the same class of error in the opposite direction.
+ *   - It covers every future internal pack for free, instead of one declared
+ *     slug at a time.
+ *
+ * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
+ * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
+ * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
+ * this module — so changing the wording changes both sides in the same edit and
+ * cannot desynchronise them. The pack's own label (`fleet db error:`,
+ * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
+ * unaffected. That is the property `stripClassPrefix` lacked when it drifted
+ * from its own classifier three times and needed a CI gate to hold them
+ * together.
+ *
+ * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
+ * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
+ * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
+ * availability failure" is decided from the actual status code, never re-derived
+ * by scraping a number out of a sentence. A 404 from our own registry for a slug
+ * that does not exist is a caller's bad argument and is deliberately NOT marked.
+ */
+
+/**
+ * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
+ *
+ * ONE value, not three, unlike `internal_db_*`. That split existed because a
+ * slow query, an exhausted pool and an unknown SQLSTATE have different owners
+ * and different fixes. Here there is only one story to tell — an origin we run
+ * did not answer the edge — and one owner. A bucket with no distinct owner per
+ * value is decoration; #724 is what happens when a class holds several
+ * situations, and inventing sub-values ahead of a reason to act on them
+ * differently is the same mistake with the sign flipped.
+ *
+ * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
+ * values. `classifyToolError` still answers `upstream_down` for the retry and
+ * hint paths, which only care whether retrying or a sibling tool might work —
+ * and it might. Nothing a caller sees or is charged changes here.
+ *
+ * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
+ * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
+ * lands on no dashboard — fleet #721 is the warning, where the #719 split
+ * worked on the write side and was invisible for weeks.
+ */
+const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
+
+/**
+ * The token that carries "this origin is ours" from the call site to the
+ * classifier.
+ *
+ * Appended to the error message rather than attached to the Error object,
+ * because the object does not survive the trip: 275 packs return `{ error:
+ * string }` instead of throwing, the gateway reads `observedError` as a string,
+ * and the fleet pack rebuilds its error from a captured status + body across a
+ * retry loop. A property on an Error would be dropped by every one of those
+ * paths and the class would work in tests and vanish in production.
+ *
+ * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
+ * string is appended to a pack's thrown Error message (shared/src/http.ts),
+ * and a thrown Error's message is exactly what the gateway hands back to the
+ * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
+ * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
+ * which does not touch this suffix) — so the original wording,
+ * " [pipeworx-hosted origin — our own service, not a third party]", was not a
+ * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
+ * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
+ * naming Pipeworx as the host. check:hosting-claims never caught it because it
+ * did not scan shared/ at all (task #2009). Reworded to describe the
+ * OBSERVATION (the origin did not answer) without a claim about who runs it —
+ * the identical fix labelAge got: drop the possessive, keep the fact.
+ */
+const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
+
+/**
+ * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
+ * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ *
+ * Matching the shape rather than listing the ref keeps this correct when we add
+ * a project — `supabaseEnv` on a pack entry already points some packs at a
+ * second one — while still excluding `status.supabase.co`, which is Supabase's
+ * own status page and emphatically not our database. Verified 2026-09-02 by
+ * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
+ * only real project ref anywhere in the tree is ours, the rest are doc
+ * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
+ * finding internal-db-class.ts relies on for the PostgREST envelope being ours
+ * by construction.
+ */
+const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
+
+/**
+ * Is this a host WE run?
+ *
+ * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
+ * hosted on workers.dev, so the suffix says where something runs and not who
+ * owns it. Every internal call we actually make goes to a `pipeworx.io`
+ * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
+ * question and DOES include `workers.dev` — a documented divergence
+ * (task #2051), not a bug to converge. That list decides what a response may
+ * cite as a data SOURCE, where a false negative (citing our own worker as an
+ * external source) is the hosting-disclosure leak this whole file exists to
+ * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
+ * outage metrics read by on-call, where a false positive (crediting our own
+ * infra with a third party's outage) hides the real failure, so it errs
+ * narrow. Same suffix, opposite direction, because they are never called for
+ * the same reason.
+ *
+ * Returns false on anything unparseable rather than throwing — this runs inside
+ * an error path, and an error path that can itself throw turns a diagnosable
+ * failure into a mystery.
+ */
+function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
+  if (!url) return false;
+  let host: string;
+  try {
+    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
+  return SUPABASE_PROJECT_HOST.test(host);
+}
+
+/**
+ * Append the marker when this failure was OUR origin failing to answer.
+ *
+ * `status` is the HTTP status when there is one, and omitted for a timeout —
+ * where there is no response at all, and "the origin did not answer" is the
+ * whole observation. Statuses below 500 are left alone: a 404 from our own
+ * registry for a slug that does not exist is the caller's argument, not our
+ * outage, and marking it would put ordinary 404s on the incident dashboard.
+ *
+ * Idempotent, so a message that is wrapped and re-marked on the way up (the
+ * fleet pack's retry loop re-throws through two layers) carries the marker once.
+ */
+function markInternalOrigin(
+  message: string,
+  url: string | URL | undefined | null,
+  status?: number,
+): string {
+  if (status !== undefined && status < 500) return message;
+  if (!isPipeworxOrigin(url)) return message;
+  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
+  return message + INTERNAL_ORIGIN_MARKER;
+}
+
+/**
+ * Which blob4 value a failure from our own web services books as, or undefined
+ * if this is not one.
+ *
+ * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
+ * from our own Supabase is a strictly more specific statement about the same
+ * row (which of our services, and why), and the two cannot disagree about
+ * whether the failure is ours.
+ */
+function internalHostMetricsClass(error: string): string | undefined {
+  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
+}
+
 
 /**
  * One place to turn a failed `fetch` into an error a caller can act on.
@@ -434,185 +635,6 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
-
-/**
- * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
- *
- * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
- * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
- * covered the majority and structurally could not cover the rest: the rest
- * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
- * the 24h to 2026-09-02T15:00Z (fleet #1096):
- *
- *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
- *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
- *
- * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
- * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
- * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
- * our own Supabase for fleet. There is no third party anywhere in either call.
- * Same defect as #1089: our own outage filed under `upstream_down`, the one
- * class that means "the source is unreachable and there is nothing for us to
- * fix", which is why the problem-tools triage skips it.
- *
- * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
- * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
- * one site today, so it would work today. It would also rot the first time
- * somebody rewords a label — silently, and in the direction of hiding our own
- * outage, which is worse than the bug being fixed. Every prose rule in
- * error-class.ts has needed widening as packs invented new wording (#409/#450/
- * #584); that history is most of that file's comment budget.
- *
- * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
- * hostname is a fact about the call, not a guess about its prose. Two
- * consequences that a pack-level flag could not give us, and the reason the
- * flag was rejected:
- *
- *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
- *     Supabase AND to genuine third parties; `court-listener` holds our cache
- *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
- *     either pack would relabel a real third-party outage as ours — inventing
- *     work, which is the same class of error in the opposite direction.
- *   - It covers every future internal pack for free, instead of one declared
- *     slug at a time.
- *
- * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
- * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
- * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
- * this module — so changing the wording changes both sides in the same edit and
- * cannot desynchronise them. The pack's own label (`fleet db error:`,
- * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
- * unaffected. That is the property `stripClassPrefix` lacked when it drifted
- * from its own classifier three times and needed a CI gate to hold them
- * together.
- *
- * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
- * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
- * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
- * availability failure" is decided from the actual status code, never re-derived
- * by scraping a number out of a sentence. A 404 from our own registry for a slug
- * that does not exist is a caller's bad argument and is deliberately NOT marked.
- */
-
-/**
- * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
- *
- * ONE value, not three, unlike `internal_db_*`. That split existed because a
- * slow query, an exhausted pool and an unknown SQLSTATE have different owners
- * and different fixes. Here there is only one story to tell — an origin we run
- * did not answer the edge — and one owner. A bucket with no distinct owner per
- * value is decoration; #724 is what happens when a class holds several
- * situations, and inventing sub-values ahead of a reason to act on them
- * differently is the same mistake with the sign flipped.
- *
- * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
- * values. `classifyToolError` still answers `upstream_down` for the retry and
- * hint paths, which only care whether retrying or a sibling tool might work —
- * and it might. Nothing a caller sees or is charged changes here.
- *
- * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
- * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
- * lands on no dashboard — fleet #721 is the warning, where the #719 split
- * worked on the write side and was invisible for weeks.
- */
-const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
-
-/**
- * The token that carries "this origin is ours" from the call site to the
- * classifier.
- *
- * Appended to the error message rather than attached to the Error object,
- * because the object does not survive the trip: 275 packs return `{ error:
- * string }` instead of throwing, the gateway reads `observedError` as a string,
- * and the fleet pack rebuilds its error from a captured status + body across a
- * retry loop. A property on an Error would be dropped by every one of those
- * paths and the class would work in tests and vanish in production.
- *
- * Written as a sentence rather than a sigil because it is going to be read by
- * whoever gets the error, and "our own service, not a third party" is the
- * single most useful thing to tell them — fetchWithTimeout's own comment
- * (fleet #1047) is about exactly this ambiguity, where blaming a healthy vendor
- * by name sent the next person waiting for an outage that did not exist.
- */
-const INTERNAL_ORIGIN_MARKER = ' [pipeworx-hosted origin — our own service, not a third party]';
-
-/**
- * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
- * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
- *
- * Matching the shape rather than listing the ref keeps this correct when we add
- * a project — `supabaseEnv` on a pack entry already points some packs at a
- * second one — while still excluding `status.supabase.co`, which is Supabase's
- * own status page and emphatically not our database. Verified 2026-09-02 by
- * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
- * only real project ref anywhere in the tree is ours, the rest are doc
- * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
- * finding internal-db-class.ts relies on for the PostgREST envelope being ours
- * by construction.
- */
-const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
-
-/**
- * Is this a host WE run?
- *
- * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
- * hosted on workers.dev, so the suffix says where something runs and not who
- * owns it. Every internal call we actually make goes to a `pipeworx.io`
- * hostname or to our Supabase project, both of which are ownership facts.
- *
- * Returns false on anything unparseable rather than throwing — this runs inside
- * an error path, and an error path that can itself throw turns a diagnosable
- * failure into a mystery.
- */
-function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
-  if (!url) return false;
-  let host: string;
-  try {
-    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
-  return SUPABASE_PROJECT_HOST.test(host);
-}
-
-/**
- * Append the marker when this failure was OUR origin failing to answer.
- *
- * `status` is the HTTP status when there is one, and omitted for a timeout —
- * where there is no response at all, and "the origin did not answer" is the
- * whole observation. Statuses below 500 are left alone: a 404 from our own
- * registry for a slug that does not exist is the caller's argument, not our
- * outage, and marking it would put ordinary 404s on the incident dashboard.
- *
- * Idempotent, so a message that is wrapped and re-marked on the way up (the
- * fleet pack's retry loop re-throws through two layers) carries the marker once.
- */
-function markInternalOrigin(
-  message: string,
-  url: string | URL | undefined | null,
-  status?: number,
-): string {
-  if (status !== undefined && status < 500) return message;
-  if (!isPipeworxOrigin(url)) return message;
-  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
-  return message + INTERNAL_ORIGIN_MARKER;
-}
-
-/**
- * Which blob4 value a failure from our own web services books as, or undefined
- * if this is not one.
- *
- * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
- * from our own Supabase is a strictly more specific statement about the same
- * row (which of our services, and why), and the two cannot disagree about
- * whether the failure is ours.
- */
-function internalHostMetricsClass(error: string): string | undefined {
-  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
-}
-
-
 /**
  * Twelve Data MCP.
  */
@@ -635,7 +657,7 @@ const UA = 'pipeworx-mcp-twelvedata/1.0 (+https://pipeworx.io)';
 const SYMBOL = {
   type: 'string' as const,
   description:
-    'Ticker/symbol. Stocks e.g. "AAPL", "MSFT"; forex "EUR/USD"; crypto "BTC/USD"; ETFs "SPY"; indices "IXIC". Comma-separate for a batch (e.g. "AAPL,MSFT").',
+    'Ticker/symbol. Stocks e.g. "AAPL", "MSFT"; forex "EUR/USD"; crypto "BTC/USD"; ETFs "SPY". Comma-separate for a batch (e.g. "AAPL,MSFT"). Market indices (SPX, N225, …) need a Grow-or-higher Twelve Data key passed via _apiKey — the shared key cannot quote them.',
 };
 const INTERVAL = {
   type: 'string' as const,
@@ -647,6 +669,17 @@ const START_DATE = { type: 'string' as const, description: 'Optional start of ra
 const END_DATE = { type: 'string' as const, description: 'Optional end of range, "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS".' };
 const ORDER = { type: 'string' as const, description: 'Sort order: "asc" or "desc" (default desc, newest first).' };
 const TIMEZONE = { type: 'string' as const, description: 'Optional timezone, e.g. "America/New_York" or "UTC".' };
+// Reference lists (/etf, /indices) are UNBOUNDED upstream: an unfiltered /etf is
+// 64,754 rows / 17 MB, which no model can read and which took a 25s fetch
+// timeout mid-body on 2026-09-16 — reported to the caller as "200 response was
+// not JSON" because the parse path swallowed the abort (fleet #2121). The vendor
+// supports page/outputsize with a key, and `count` stays the TOTAL matched, so
+// we page by default and say so in the payload.
+const REF_DEFAULT_OUTPUTSIZE = 200;
+const REF_PAGE = { type: 'number' as const, description: 'Page of the reference list (default 1). `count` in the response is the TOTAL matched; `data` is this page.' };
+const REF_OUTPUTSIZE = { type: 'number' as const, description: `Rows per page (default ${REF_DEFAULT_OUTPUTSIZE}, max 5000). The unfiltered ETF list is 64,000+ rows, so narrow with symbol / country / exchange rather than raising this.` };
+const REF_COUNTRY = { type: 'string' as const, description: 'Optional country filter — full name or alpha code (e.g. "Japan", "Germany", "United States", "US").' };
+const MIC_CODE = { type: 'string' as const, description: 'Optional ISO 10383 market identifier code filter (e.g. "XNAS", "XLON").' };
 
 const tools: McpToolExport['tools'] = [
   {
@@ -722,15 +755,34 @@ const tools: McpToolExport['tools'] = [
   },
   {
     name: 'etfs',
-    description: 'Twelve Data reference list of all supported ETF symbols with exchange and country metadata. Use to discover or validate ETF tickers before querying price endpoints.',
-    inputSchema: { type: 'object', properties: { symbol: { type: 'string', description: 'Optional ETF ticker filter (e.g. "SPY").' } } },
+    description:
+      'Twelve Data reference list of supported ETF symbols (64,000+ listings worldwide) with exchange and country metadata — paged, default 200 rows, `count` is the total matched. Filter by symbol (e.g. "SPY"), country or exchange. Use to discover or validate ETF tickers before querying price endpoints. A stock ticker (e.g. "AAPL") is not an ETF and returns an empty list with `empty_reason: wrong_instrument_class` — use the stocks tool for those.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: 'Optional ETF ticker filter (e.g. "SPY", "QQQ", "VTI").' },
+        exchange: EXCHANGE,
+        mic_code: MIC_CODE,
+        country: REF_COUNTRY,
+        page: REF_PAGE,
+        outputsize: REF_OUTPUTSIZE,
+      },
+    },
   },
   {
     name: 'indices',
-    description: 'Twelve Data reference list of all supported market index symbols (e.g. SPX, DJI) with exchange metadata. Use to discover or validate index tickers before querying time_series.',
+    description:
+      'Twelve Data reference list of supported market index symbols with exchange metadata — about 1,300 NON-US indices (e.g. N225 Nikkei 225, 000001 SSE Composite, NSEI Nifty 50), paged, default 200 rows. Filter by country (e.g. "Japan", "India", "China"), exchange or symbol. US indices (SPX, DJI, IXIC, NDX, VIX) are NOT in Twelve Data\'s reference list and quoting them requires a Grow-or-higher Twelve Data key via _apiKey — a US filter here returns that refusal, not an empty list. Use to discover or validate index tickers before querying time_series.',
     inputSchema: {
       type: 'object',
-      properties: { symbol: { type: 'string', description: 'Optional index filter (e.g. "IXIC").' }, country: { type: 'string', description: 'Optional country filter (e.g. "United States").' } },
+      properties: {
+        symbol: { type: 'string', description: 'Optional index symbol filter (e.g. "N225", "NSEI", "000001"). US symbols such as SPX/DJI/IXIC are not in this list — see the tool description.' },
+        country: { type: 'string', description: 'Optional country filter, full name or alpha code (e.g. "Japan", "India", "China", "Germany"). "United States" returns a plan refusal, not rows.' },
+        exchange: EXCHANGE,
+        mic_code: MIC_CODE,
+        page: REF_PAGE,
+        outputsize: REF_OUTPUTSIZE,
+      },
     },
   },
   {
@@ -817,9 +869,28 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     // act on, which is why exchange_rate and currency_conversion went 23 calls
     // with zero successes: the information needed to self-correct existed in the
     // response and we threw it away.
-    const body = (await res.json().catch(() => null)) as
-      | { status?: string; code?: number; message?: string }
-      | null;
+    // Read the body as TEXT, then parse — two failures that used to share one
+    // message. `res.json().catch(() => null)` turned an AbortError thrown while
+    // streaming a 17 MB reference list (the 25s fetchWithTimeout signal covers
+    // the body read too) into "200 response was not JSON", which sent the
+    // reader hunting for a malformed vendor payload that did not exist
+    // (fleet #2121, 2026-09-16: the same call parsed fine at 5.1s upstream).
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (err) {
+      const name = err instanceof Error ? err.name : 'Error';
+      throw new Error(
+        `upstream_down: Twelve Data answered HTTP ${res.status} but the response body could not be read in full (${name}) — ` +
+          `the payload is too large or too slow for this request. Narrow it (symbol / country / exchange) or lower outputsize, then retry.`,
+      );
+    }
+    let body: { status?: string; code?: number; message?: string } | null = null;
+    try {
+      body = text ? (JSON.parse(text) as { status?: string; code?: number; message?: string }) : null;
+    } catch {
+      body = null;
+    }
     const upstreamMsg = body?.message?.trim();
     // Plan gates before anything else. Twelve Data phrases them two ways
     // ("/earnings is available exclusively with grow or pro or ultra … plans",
@@ -846,10 +917,111 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     // A 200 we couldn't parse is a real defect, not an empty result — throw rather
     // than returning null, so it lands in the error class instead of counting as a
     // successful call nobody can see.
-    if (body == null) throw new Error(`Twelve Data: ${res.status} response was not JSON`);
+    if (body == null) {
+      throw new Error(`Twelve Data: ${res.status} response was not JSON (${text.length} bytes, starts: ${JSON.stringify(text.slice(0, 80))})`);
+    }
     return body;
   };
+  // ── Reference lists: paged, and honest about WHY a filter matched nothing ──
+  type RefRow = Record<string, unknown>;
+  type RefBody = { data?: RefRow[]; count?: number; status?: string };
+  const refList = async (path: string, params: Record<string, unknown>) => {
+    const page = Math.max(1, Number(params.page) || 1);
+    const outputsize = Math.min(5000, Math.max(1, Number(params.outputsize) || REF_DEFAULT_OUTPUTSIZE));
+    const body = (await get(path, { ...params, page, outputsize })) as RefBody;
+    const data = Array.isArray(body.data) ? body.data : [];
+    // With page/outputsize the vendor keeps `count` as the TOTAL matched (verified
+    // 2026-09-16: country=United States, outputsize=3, page=2 -> count 11345, 3 rows).
+    const total = typeof body.count === 'number' ? body.count : data.length;
+    const from = (page - 1) * outputsize;
+    const out: RefBody & { returned: number; page: number; outputsize: number; truncated: boolean; hint?: string } = {
+      ...body,
+      data,
+      count: total,
+      returned: data.length,
+      page,
+      outputsize,
+      truncated: from + data.length < total,
+    };
+    if (out.truncated) {
+      out.hint = `Showing rows ${from + 1}–${from + data.length} of ${total}. Pass page=${page + 1} for the next page, or narrow with symbol / country / exchange.`;
+    } else if (data.length === 0 && total > 0) {
+      out.hint = `page=${page} is past the end: only ${total} rows match (${Math.ceil(total / outputsize)} page(s) of ${outputsize}).`;
+    }
+    return out;
+  };
+
+  // A symbol that matched nothing in a reference list is usually the RIGHT
+  // ticker for the WRONG instrument class — 41 distinct callers sent "AAPL" to
+  // the ETF list in the 30d to 2026-09-16 and every one got a bare []. Ask
+  // symbol_search (one extra call, only on the empty path) what the symbol IS,
+  // and say so via the gateway's `empty_reason` passthrough (fleet #2112).
+  const instrumentHint = async (symbol: string, wanted: 'ETF' | 'Index', listTool: string): Promise<{ empty_reason: string; hint: string } | null> => {
+    try {
+      const s = (await get('/symbol_search', { symbol, outputsize: 30 })) as { data?: Array<{ symbol?: string; instrument_name?: string; instrument_type?: string; exchange?: string; country?: string }> };
+      const exact = (s.data ?? []).filter((r) => String(r.symbol ?? '').toUpperCase() === symbol.toUpperCase());
+      const types = [...new Set(exact.map((r) => r.instrument_type ?? 'unknown'))];
+      if (exact.length === 0) {
+        return { empty_reason: 'no_match', hint: `"${symbol}" matches no instrument of any class on Twelve Data (symbol_search found nothing). Check the ticker.` };
+      }
+      if (!types.includes(wanted)) {
+        const first = exact[0];
+        const next = types.includes('Common Stock') || types.includes('Depositary Receipt') ? 'the stocks tool to validate it, then quote / price / time_series' : 'quote or time_series';
+        return {
+          empty_reason: 'wrong_instrument_class',
+          hint: `"${symbol}" is not an ${wanted} on Twelve Data — it is ${types.join(' / ')} (${first.instrument_name ?? '?'}, ${first.exchange ?? '?'}). The ${listTool} tool lists ${wanted === 'ETF' ? 'ETFs' : 'indices'} only; use ${next} with this symbol.`,
+        };
+      }
+    } catch {
+      /* the hint is best-effort; the empty result stands on its own */
+    }
+    return null;
+  };
+
+  // US market indices are NOT in Twelve Data's /indices reference list — 1,302
+  // rows, zero with country "United States", identical with and without a key
+  // (checked 2026-09-16, so this is the vendor's catalogue, not our plan hiding
+  // rows). Quoting them is a plan wall: quote SPX on the shared key answers
+  // "This symbol is available starting with the Grow or Venture plan". 34
+  // distinct callers followed our own "United States" example into a clean
+  // empty (fleet #2120). Say the true thing instead — and only when the list
+  // really came back empty, so if the vendor ever re-adds US rows this path
+  // stops firing on its own.
+  const US_COUNTRY = /^(united states|united states of america|usa|us|u\.s\.a?\.?|america)$/i;
+  const US_EXCHANGE = /^(nyse|nasdaq|cboe|amex|nyse arca|arca|nyse american)$/i;
+  const US_MIC = new Set(['XNYS', 'XNAS', 'XNGS', 'XNMS', 'XNCM', 'XCBO', 'ARCX', 'XASE', 'BATS', 'IEXG']);
+  const US_INDEX_SYMBOLS = new Set(['SPX', 'GSPC', 'SP500', 'DJI', 'DJIA', 'IXIC', 'COMP', 'NDX', 'RUT', 'VIX', 'OEX', 'MID', 'SML', 'NYA', 'XAX', 'W5000', 'DJT', 'DJU', 'SOX', 'RUA']);
+  const isUsIndexQuery = (a: Record<string, unknown>) =>
+    US_COUNTRY.test(String(a.country ?? '').trim()) ||
+    US_EXCHANGE.test(String(a.exchange ?? '').trim()) ||
+    US_MIC.has(String(a.mic_code ?? '').trim().toUpperCase()) ||
+    US_INDEX_SYMBOLS.has(String(a.symbol ?? '').trim().toUpperCase().replace(/^[\^.]/, ''));
+  const US_INDICES_REFUSAL =
+    "Twelve Data: US market indices (SPX, DJI, IXIC, NDX, RUT, VIX) are not in Twelve Data's /indices reference list — it carries ~1,300 non-US indices and zero US rows, with or without a key — and quoting them requires an API key on a paid Twelve Data plan (Grow or higher); the platform's shared key does not include them. " +
+    'Vendor message for quote SPX: "This symbol is available starting with the Grow or Venture plan. Consider upgrading now at https://twelvedata.com/pricing". ' +
+    'If you have a Grow/Pro/Ultra Twelve Data key, pass it via the _apiKey argument and call quote or time_series with symbol "SPX" directly — do not use this list to validate it first. ' +
+    'For non-US indices this tool works as documented: try country "Japan", "India" or "China".';
+
   switch (name) {
+    case 'etfs': {
+      const out = await refList('/etf', args);
+      const symbol = String(args.symbol ?? '').trim();
+      if (out.returned === 0 && out.count === 0 && symbol) {
+        const why = await instrumentHint(symbol, 'ETF', 'etfs');
+        if (why) return { ...out, ...why };
+      }
+      return out;
+    }
+    case 'indices': {
+      const out = await refList('/indices', args);
+      if (out.returned === 0 && out.count === 0 && isUsIndexQuery(args)) throw new Error(US_INDICES_REFUSAL);
+      const symbol = String(args.symbol ?? '').trim();
+      if (out.returned === 0 && out.count === 0 && symbol) {
+        const why = await instrumentHint(symbol, 'Index', 'indices');
+        if (why) return { ...out, ...why };
+      }
+      return out;
+    }
     case 'technical_indicator': {
       const indicator = String(args.indicator ?? '').toLowerCase().trim();
       if (!ALLOWED_INDICATORS.has(indicator)) {
@@ -876,10 +1048,6 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return get('/forex_pairs', args);
     case 'cryptocurrencies':
       return get('/cryptocurrencies', args);
-    case 'etfs':
-      return get('/etf', args);
-    case 'indices':
-      return get('/indices', args);
     case 'earnings':
       return get('/earnings', args);
     case 'earnings_calendar':

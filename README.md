@@ -2,7 +2,7 @@
 
 [Twelve Data](https://twelvedata.com/docs) MCP — stock, ETF, forex, crypto data. Free 800 req/day.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1558+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1576+ live data sources.
 
 ## Auth
 
@@ -19,8 +19,8 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 - `stocks(symbol?, exchange?, mic_code?, country?, type?, format?)` — stock symbols
 - `forex_pairs(symbol?, currency_base?, currency_quote?, format?)` — forex pairs
 - `cryptocurrencies(symbol?, exchange?, currency_base?, currency_quote?, format?)` — crypto symbols
-- `etfs(symbol?, exchange?, country?, format?)` — ETF symbols
-- `indices(symbol?, country?, format?)` — index symbols
+- `etfs(symbol?, exchange?, mic_code?, country?, page?, outputsize?)` — ETF symbols, paged (default 200 rows; `count` is the total). A stock ticker returns `empty_reason: wrong_instrument_class` with a pointer to `stocks`.
+- `indices(symbol?, country?, exchange?, mic_code?, page?, outputsize?)` — index symbols, paged. ~1,300 non-US indices only: **US indices (SPX, DJI, IXIC) are not in Twelve Data's reference list**, and quoting them requires a Grow-or-higher key via `_apiKey`; a US filter returns that refusal rather than an empty list.
 - `earnings(symbol, exchange?, country?, mic_code?, type?, period?, outputsize?, format?, dp?, start_date?, end_date?)` — earnings calendar
 - `earnings_calendar(start_date?, end_date?, country?, format?, dp?)` — broad earnings calendar
 - `dividends(symbol, exchange?, country?, mic_code?, range?, start_date?, end_date?)` — dividends
@@ -75,7 +75,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1558+ data sources. The
+Both URLs reach the same gateway and the same 1576+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
