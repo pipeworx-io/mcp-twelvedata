@@ -25,6 +25,93 @@ interface McpToolExport {
 }
 
 /**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -879,9 +966,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     try {
       text = await res.text();
     } catch (err) {
+      // err.name is a fixed JS Error name (AbortError, TypeError, …), never a
+      // routing token — this pack never sets a custom .name — but the gate
+      // can't tell that statically, so drop is a documented no-op here rather
+      // than a real defect (checked: `upstream_down:` is already at position 0).
       const name = err instanceof Error ? err.name : 'Error';
       throw new Error(
-        `upstream_down: Twelve Data answered HTTP ${res.status} but the response body could not be read in full (${name}) — ` +
+        `upstream_down: Twelve Data answered HTTP ${res.status} but the response body could not be read in full (${dropClassPrefix(name)}) — ` +
           `the payload is too large or too slow for this request. Narrow it (symbol / country / exchange) or lower outputsize, then retry.`,
       );
     }
@@ -928,10 +1019,21 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   const refList = async (path: string, params: Record<string, unknown>) => {
     const page = Math.max(1, Number(params.page) || 1);
     const outputsize = Math.min(5000, Math.max(1, Number(params.outputsize) || REF_DEFAULT_OUTPUTSIZE));
-    const body = (await get(path, { ...params, page, outputsize })) as RefBody;
+    // The vendor's `page` is ZERO-BASED, whatever its docs say: the offset it
+    // applies is page * outputsize, and omitting `page` behaves as page 0.
+    // Measured live through the gateway on 2026-09-16 with stocks?symbol=AAPL
+    // (count 12): page=0 & outputsize=3 -> BVC, BVL, VSE; no page -> the same
+    // three; page=2 -> GPW, IEX, SIX (rows 7-9). And on /etf?symbol=SPY (count 5):
+    // page=1 with outputsize 2 -> 2 rows, 4 -> 1 row, 5 -> 0 rows — i.e. the
+    // rows AFTER the first `outputsize`. The first cut of this paging sent page=1
+    // by default and so silently skipped the first 200 rows of every filtered
+    // list: indices {"country":"Japan"} (count 1) and etfs {"symbol":"SPY"}
+    // (count 5) came back {"data":[],"count":N} for ~35 minutes on 2026-09-16.
+    // Our `page` stays 1-based for callers; only the wire value is shifted.
+    const body = (await get(path, { ...params, page: page - 1, outputsize })) as RefBody;
     const data = Array.isArray(body.data) ? body.data : [];
     // With page/outputsize the vendor keeps `count` as the TOTAL matched (verified
-    // 2026-09-16: country=United States, outputsize=3, page=2 -> count 11345, 3 rows).
+    // 2026-09-16: country=United States, outputsize=3 -> count 11345, 3 rows).
     const total = typeof body.count === 'number' ? body.count : data.length;
     const from = (page - 1) * outputsize;
     const out: RefBody & { returned: number; page: number; outputsize: number; truncated: boolean; hint?: string } = {
@@ -943,10 +1045,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       outputsize,
       truncated: from + data.length < total,
     };
-    if (out.truncated) {
-      out.hint = `Showing rows ${from + 1}–${from + data.length} of ${total}. Pass page=${page + 1} for the next page, or narrow with symbol / country / exchange.`;
-    } else if (data.length === 0 && total > 0) {
+    if (data.length === 0 && total > 0) {
+      // An empty page with a non-zero total is a page past the end (or the
+      // vendor skipping rows again). Say that; never "Showing rows 1–0 of 1".
+      out.truncated = false;
       out.hint = `page=${page} is past the end: only ${total} rows match (${Math.ceil(total / outputsize)} page(s) of ${outputsize}).`;
+    } else if (out.truncated) {
+      out.hint = `Showing rows ${from + 1}–${from + data.length} of ${total}. Pass page=${page + 1} for the next page, or narrow with symbol / country / exchange.`;
     }
     return out;
   };
