@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-twelvedata",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Twelve Data MCP.",
   "type": "module",
   "main": "src/index.ts",
@@ -24,5 +24,9 @@
   "devDependencies": {
     "typescript": "^5.9.3",
     "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-3e557acd97e7b679e2f02512dab66aa9911561e7178e8b5ec4cfa368887ae8dc",
+    "sourceCommit": "b0fb3c31386cf0256dcf1e2f1b3440435a87ec35"
   }
 }
