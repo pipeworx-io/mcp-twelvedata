@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-twelvedata",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Twelve Data MCP.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-twelvedata": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "twelvedata"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-twelvedata.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/twelvedata",
   "pipeworx": {
-    "sourceHash": "v1-8e13679386492baa88f4ec9cc84ce1a932c5df7c3529ec2248d2f337105a2603",
-    "sourceCommit": "66a0692f029179984440cef6938cba7fdd41d66d"
+    "mode": "gateway",
+    "slug": "twelvedata",
+    "gatewaySlug": "twelvedata",
+    "sourceHash": "v1-f19db21780e1a174683011df2203c9a2e682e5db41b79351bbbbfc898c08b633",
+    "sourceCommit": "f47d581679e1e887373df51ba623f891fbe4c464"
   }
 }
