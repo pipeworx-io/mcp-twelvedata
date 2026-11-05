@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-twelvedata",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Twelve Data MCP.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "twelvedata",
     "gatewaySlug": "twelvedata",
-    "sourceHash": "v1-f19db21780e1a174683011df2203c9a2e682e5db41b79351bbbbfc898c08b633",
-    "sourceCommit": "f47d581679e1e887373df51ba623f891fbe4c464"
+    "sourceHash": "v1-9e5946c7459ee3f38a26e09014dcd893f44e70573869d595dd6e596f3016c2f4",
+    "sourceCommit": "868e119d526d5409447b7ee2149afba7eb9d2593"
   }
 }
